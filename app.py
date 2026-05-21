@@ -66,6 +66,13 @@ def _load_models(device: torch.device) -> tuple[nn.Module, nn.Module]:
 
     matrix_model.eval()
 
+    # Warm-up pass to initialize GPU memory and cuDNN benchmarks during startup
+    if device.type == 'cuda':
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224).to(device)
+            _ = matrix_model(dummy_input)
+            torch.cuda.synchronize()
+
     return matrix_model
 
 
