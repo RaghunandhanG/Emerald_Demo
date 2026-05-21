@@ -66,16 +66,6 @@ def _load_models(device: torch.device) -> tuple[nn.Module, nn.Module]:
 
     matrix_model.eval()
 
-    # Warm-up pass to initialize GPU memory and cuDNN benchmarks during startup
-    if device.type == 'cuda':
-        t_start = time.perf_counter()
-        with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 224, 224).to(device)
-            _ = matrix_model(dummy_input)
-            torch.cuda.synchronize()
-        t_end = time.perf_counter()
-        print(f"--- Model Warm-up Complete: {(t_end - t_start) * 1000:.2f} ms ---")
-
     return matrix_model
 
 
@@ -103,6 +93,15 @@ def _compute_similarity(
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t0 = time.perf_counter()
+    
+    # Warm-up pass every single time to combat Windows NVIDIA P-State idling
+    if device.type == 'cuda':
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224).to(device)
+            _ = matrix_model(dummy_input)
+            torch.cuda.synchronize()
+    
+    t_warmup = time.perf_counter()
 
     # Pre-allocate and batch without individual image to(device) calls first
     # This avoids multiple PCIe bus transfers between CPU and GPU
@@ -157,7 +156,8 @@ def _compute_similarity(
     is_defect = difference >= threshold
     
     print(f"--- Inference Time Breakdown ---")
-    print(f"Transforms (CPU)        : {(t1 - t0) * 1000:.2f} ms")
+    print(f"GPU Wake-up (Warm-up)   : {(t_warmup - t0) * 1000:.2f} ms")
+    print(f"Transforms (CPU)        : {(t1 - t_warmup) * 1000:.2f} ms")
     print(f"PCIe Transfer to GPU    : {(t2 - t1) * 1000:.2f} ms")
     print(f"Pass 1 Forward          : {(t_pass1 - t2) * 1000:.2f} ms")
     print(f"Pass 2 Forward          : {(t3 - t_pass1) * 1000:.2f} ms")
