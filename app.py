@@ -101,7 +101,7 @@ def _compute_similarity(
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
-    t2 = time.perf_counter()
+    t3 = time.perf_counter()
 
     # Calculate vector features manually from matrix features
     with torch.no_grad():
