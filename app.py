@@ -59,18 +59,14 @@ def _load_models(device: torch.device) -> tuple[nn.Module, nn.Module]:
 
     base_model = base_model.to(device)
 
-    vector_model = nn.Sequential(
-        *list(base_model.children())[:-1]
-    ).to(device)
-
+    # We only need the matrix model (up to spatial features), we will manually pool for vectors
     matrix_model = nn.Sequential(
         *list(base_model.children())[:-2]
     ).to(device)
 
-    vector_model.eval()
     matrix_model.eval()
 
-    return vector_model, matrix_model
+    return matrix_model
 
 
 def _get_transform() -> transforms.Compose:
@@ -91,7 +87,6 @@ def _compute_similarity(
     live_image: Image.Image,
     threshold: float,
     device: torch.device,
-    vector_model: nn.Module,
     matrix_model: nn.Module,
     transform: transforms.Compose,
 ) -> SimilarityResult:
@@ -99,48 +94,65 @@ def _compute_similarity(
         torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    # Batch inputs
-    ref_tensor = transform(ref_image).unsqueeze(0).to(device)
-    live_tensor = transform(live_image).unsqueeze(0).to(device)
-    batch_tensor = torch.cat([ref_tensor, live_tensor], dim=0)
+    # Pre-allocate and batch without individual image to(device) calls first
+    # This avoids multiple PCIe bus transfers between CPU and GPU
+    ref_tensor = transform(ref_image).unsqueeze(0)
+    live_tensor = transform(live_image).unsqueeze(0)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t1 = time.perf_counter()
 
-    # Single Pass: Matrix Model (batched)
-    with torch.no_grad():
-        mat_batch = matrix_model(batch_tensor)
-        
-        # Flatten the matrix outputs to vector form for matrix similarity
-        mat_ref_flat = mat_batch[0:1].view(1, -1)
-        mat_live_flat = mat_batch[1:2].view(1, -1)
-        matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
+    # Send individually now
+    ref_tensor = ref_tensor.to(device)
+    live_tensor = live_tensor.to(device)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t2 = time.perf_counter()
 
-    # Calculate vector features manually from matrix features
+    # Two Passes: Matrix Model
     with torch.no_grad():
-        feat_batch = F.adaptive_avg_pool2d(mat_batch, (1, 1)).view(2, -1)
-        feat_ref = feat_batch[0:1]
-        feat_live = feat_batch[1:2]
-        vector_similarity = F.cosine_similarity(feat_ref, feat_live).item()
+        mat_ref = matrix_model(ref_tensor)
+        
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_pass1 = time.perf_counter()
+        
+    with torch.no_grad():
+        mat_live = matrix_model(live_tensor)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t3 = time.perf_counter()
+
+    # Calculate vector features manually from matrix features
+    with torch.no_grad():
+        # Flatten the matrix outputs to vector form for matrix similarity
+        mat_ref_flat = mat_ref.view(1, -1)
+        mat_live_flat = mat_live.view(1, -1)
+        matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
+
+        # Vector pool calculations
+        feat_ref = F.adaptive_avg_pool2d(mat_ref, (1, 1)).view(1, -1)
+        feat_live = F.adaptive_avg_pool2d(mat_live, (1, 1)).view(1, -1)
+        vector_similarity = F.cosine_similarity(feat_ref, feat_live).item()
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t4 = time.perf_counter()
 
     final_similarity = 0.7 * vector_similarity + 0.3 * matrix_similarity
     difference = 1.0 - final_similarity
     is_defect = difference >= threshold
     
     print(f"--- Inference Time Breakdown ---")
-    print(f"Preprocessing + Transfer: {(t1 - t0) * 1000:.2f} ms")
-    print(f"Single Batched Forward  : {(t2 - t1) * 1000:.2f} ms")
-    print(f"Manual Vector Compute   : {(t3 - t2) * 1000:.2f} ms")
-    print(f"Total Similarity Func   : {(t3 - t0) * 1000:.2f} ms")
+    print(f"Transforms (CPU)        : {(t1 - t0) * 1000:.2f} ms")
+    print(f"PCIe Transfer to GPU    : {(t2 - t1) * 1000:.2f} ms")
+    print(f"Pass 1 Forward          : {(t_pass1 - t2) * 1000:.2f} ms")
+    print(f"Pass 2 Forward          : {(t3 - t_pass1) * 1000:.2f} ms")
+    print(f"Metrics & Pooling       : {(t4 - t3) * 1000:.2f} ms")
+    print(f"Total Similarity Func   : {(t4 - t0) * 1000:.2f} ms")
     print(f"--------------------------------")
 
     return SimilarityResult(
@@ -164,7 +176,7 @@ def main() -> None:
         st.success(f"GPU configured: {torch.cuda.get_device_name(0)}")
     else:
         st.warning("GPU not available, using CPU")
-    vector_model, matrix_model = _load_models(device)
+    matrix_model = _load_models(device)
     transform = _get_transform()
 
     col_left, col_right = st.columns(2)
@@ -199,7 +211,6 @@ def main() -> None:
         live_image,
         threshold,
         device,
-        vector_model,
         matrix_model,
         transform,
     )
