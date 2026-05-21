@@ -36,10 +36,12 @@ def _load_image(file) -> Image.Image:
     return _remove_transparency(image)
 
 
-def _compute_features(image: Image.Image, device: torch.device, feature_model: nn.Module, transform: transforms.Compose) -> tuple[np.ndarray, np.ndarray]:
-    tensor = transform(image).unsqueeze(0).to(device)
+def _compute_features_batch(images: list[Image.Image], device: torch.device, feature_model: nn.Module, transform: transforms.Compose) -> tuple[np.ndarray, np.ndarray]:
+    tensors = [transform(img) for img in images]
+    batch_tensor = torch.stack(tensors).to(device)
+    
     with torch.no_grad():
-        feat = feature_model(tensor)
+        feat = feature_model(batch_tensor)
 
     pooled = F.adaptive_avg_pool2d(feat, (1, 1)).view(feat.size(0), -1)
 
@@ -191,17 +193,24 @@ def main() -> None:
         pooled_ref = st.session_state.ref_cache["pooled"]
         mat_ref_flat = st.session_state.ref_cache["mat_flat"]
         cached = True
-    else:
-        # compute and store ref features
-        pooled_ref, mat_ref_flat = _compute_features(ref_image, device, feature_model, transform)
-        st.session_state.ref_cache = {"key": ref_key, "pooled": pooled_ref, "mat_flat": mat_ref_flat}
-
-    # warm GPU and measure inference for live image (and similarity)
+    
+    # warm GPU and measure inference
     if device.type == "cuda":
         torch.cuda.synchronize()
     start_time = time.perf_counter()
 
-    pooled_live, mat_live_flat = _compute_features(live_image, device, feature_model, transform)
+    if cached:
+        pooled_live_batch, mat_live_flat_batch = _compute_features_batch([live_image], device, feature_model, transform)
+        pooled_live = pooled_live_batch[0]
+        mat_live_flat = mat_live_flat_batch[0]
+    else:
+        # compute both in a single batch
+        pooled_batch, mat_flat_batch = _compute_features_batch([ref_image, live_image], device, feature_model, transform)
+        pooled_ref, pooled_live = pooled_batch[0], pooled_batch[1]
+        mat_ref_flat, mat_live_flat = mat_flat_batch[0], mat_flat_batch[1]
+        
+        # update cache
+        st.session_state.ref_cache = {"key": ref_key, "pooled": pooled_ref, "mat_flat": mat_ref_flat}
 
     # compute similarities using numpy arrays
     def cos_sim(a: np.ndarray, b: np.ndarray) -> float:
