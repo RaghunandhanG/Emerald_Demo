@@ -1,0 +1,8 @@
+# Model artifacts
+*.pth
+*.onnx
+*.onnx.data
+
+# Keep models folder structure
+models/*
+!models/.gitkeep
