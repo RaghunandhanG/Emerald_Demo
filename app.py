@@ -54,6 +54,11 @@ def _get_transform() -> transforms.Compose:
         [
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
+            # Normalize with standard ImageNet values (expected by YOLOv8 backbone as well)
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
         ]
     )
 
@@ -69,14 +74,21 @@ def _compute_similarity(
         torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    # Batch inputs
-    ref_tensor = transform(ref_image).unsqueeze(0).to(device)
-    live_tensor = transform(live_image).unsqueeze(0).to(device)
-    batch_tensor = torch.cat([ref_tensor, live_tensor], dim=0)
-
+    # Pre-allocate and batch without individual image to(device) calls first
+    # This avoids multiple PCIe bus transfers between CPU and GPU
+    ref_tensor = transform(ref_image)
+    live_tensor = transform(live_image)
+    
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t1 = time.perf_counter()
+    
+    # Send directly as a batch
+    batch_tensor = torch.stack([ref_tensor, live_tensor]).to(device)
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t2 = time.perf_counter()
 
     # Single Pass: Matrix Model (batched)
     with torch.no_grad():
@@ -100,17 +112,18 @@ def _compute_similarity(
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
-    t3 = time.perf_counter()
+    t4 = time.perf_counter()
 
     final_similarity = 0.7 * vector_similarity + 0.3 * matrix_similarity
     difference = 1.0 - final_similarity
     is_defect = difference >= threshold
     
     print(f"--- Inference Time Breakdown ---")
-    print(f"Preprocessing + Transfer: {(t1 - t0) * 1000:.2f} ms")
-    print(f"Single Batched Forward  : {(t2 - t1) * 1000:.2f} ms")
-    print(f"Manual Vector Compute   : {(t3 - t2) * 1000:.2f} ms")
-    print(f"Total Similarity Func   : {(t3 - t0) * 1000:.2f} ms")
+    print(f"Transforms (CPU)        : {(t1 - t0) * 1000:.2f} ms")
+    print(f"PCIe Transfer to GPU    : {(t2 - t1) * 1000:.2f} ms")
+    print(f"Single Batched Forward  : {(t3 - t2) * 1000:.2f} ms")
+    print(f"Manual Vector Compute   : {(t4 - t3) * 1000:.2f} ms")
+    print(f"Total Similarity Func   : {(t4 - t0) * 1000:.2f} ms")
     print(f"--------------------------------")
 
     return SimilarityResult(
