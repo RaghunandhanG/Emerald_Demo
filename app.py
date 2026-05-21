@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from pathlib import Path
 import time
+import io
+import hashlib
+import numpy as np
 
 import streamlit as st
 import torch
@@ -31,6 +34,18 @@ def _remove_transparency(image: Image.Image, bg_color: tuple[int, int, int] = (2
 def _load_image(file) -> Image.Image:
     image = Image.open(file)
     return _remove_transparency(image)
+
+
+def _compute_features(image: Image.Image, device: torch.device, feature_model: nn.Module, transform: transforms.Compose) -> tuple[np.ndarray, np.ndarray]:
+    tensor = transform(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feat = feature_model(tensor)
+
+    pooled = F.adaptive_avg_pool2d(feat, (1, 1)).view(feat.size(0), -1)
+
+    pooled_np = pooled.cpu().numpy()
+    mat_flat_np = feat.view(feat.size(0), -1).cpu().numpy()
+    return pooled_np, mat_flat_np
 
 
 @st.cache_resource
@@ -89,22 +104,21 @@ def _compute_similarity(
     feature_model: nn.Module,
     transform: transforms.Compose,
 ) -> SimilarityResult:
-    ref_tensor = transform(ref_image).unsqueeze(0).to(device)
-    live_tensor = transform(live_image).unsqueeze(0).to(device)
+    # compute features for both images (may be cached externally)
+    pooled_ref, mat_ref_flat = _compute_features(ref_image, device, feature_model, transform)
+    pooled_live, mat_live_flat = _compute_features(live_image, device, feature_model, transform)
 
-    with torch.no_grad():
-        feat_ref = feature_model(ref_tensor)
-        feat_live = feature_model(live_tensor)
+    # cosine similarity on numpy arrays
+    def cos_sim(a: np.ndarray, b: np.ndarray) -> float:
+        a_flat = a.reshape(-1)
+        b_flat = b.reshape(-1)
+        denom = float(np.linalg.norm(a_flat) * np.linalg.norm(b_flat))
+        if denom == 0.0:
+            return 0.0
+        return float(np.dot(a_flat, b_flat) / denom)
 
-        pooled_ref = F.adaptive_avg_pool2d(feat_ref, (1, 1)).view(feat_ref.size(0), -1)
-        pooled_live = F.adaptive_avg_pool2d(feat_live, (1, 1)).view(feat_live.size(0), -1)
-
-        vector_similarity = F.cosine_similarity(pooled_ref, pooled_live).item()
-
-        mat_ref_flat = feat_ref.view(feat_ref.size(0), -1)
-        mat_live_flat = feat_live.view(feat_live.size(0), -1)
-
-        matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
+    vector_similarity = cos_sim(pooled_ref, pooled_live)
+    matrix_similarity = cos_sim(mat_ref_flat, mat_live_flat)
 
     final_similarity = 0.7 * vector_similarity + 0.3 * matrix_similarity
     difference = 1.0 - final_similarity
@@ -153,23 +167,68 @@ def main() -> None:
         return
 
     try:
-        ref_image = _load_image(ref_file)
-        live_image = _load_image(live_file)
+        # read raw bytes to create a reproducible cache key
+        ref_bytes = ref_file.read()
+        ref_file.seek(0)
+        live_bytes = live_file.read()
+        live_file.seek(0)
+
+        ref_key = hashlib.md5(ref_bytes).hexdigest()
+
+        ref_image = Image.open(io.BytesIO(ref_bytes))
+        ref_image = _remove_transparency(ref_image)
+        live_image = Image.open(io.BytesIO(live_bytes))
+        live_image = _remove_transparency(live_image)
     except Exception as exc:
         st.error(f"Failed to read image: {exc}")
         return
 
     threshold = threshold_pct / 100.0
+
+    # check cache for reference features
+    cached = False
+    if "ref_cache" in st.session_state and st.session_state.ref_cache.get("key") == ref_key:
+        pooled_ref = st.session_state.ref_cache["pooled"]
+        mat_ref_flat = st.session_state.ref_cache["mat_flat"]
+        cached = True
+    else:
+        # compute and store ref features
+        pooled_ref, mat_ref_flat = _compute_features(ref_image, device, feature_model, transform)
+        st.session_state.ref_cache = {"key": ref_key, "pooled": pooled_ref, "mat_flat": mat_ref_flat}
+
+    # warm GPU and measure inference for live image (and similarity)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     start_time = time.perf_counter()
-    result = _compute_similarity(
-        ref_image,
-        live_image,
-        threshold,
-        device,
-        feature_model,
-        transform,
-    )
+
+    pooled_live, mat_live_flat = _compute_features(live_image, device, feature_model, transform)
+
+    # compute similarities using numpy arrays
+    def cos_sim(a: np.ndarray, b: np.ndarray) -> float:
+        a_flat = a.reshape(-1)
+        b_flat = b.reshape(-1)
+        denom = float(np.linalg.norm(a_flat) * np.linalg.norm(b_flat))
+        if denom == 0.0:
+            return 0.0
+        return float(np.dot(a_flat, b_flat) / denom)
+
+    vector_similarity = cos_sim(pooled_ref, pooled_live)
+    matrix_similarity = cos_sim(mat_ref_flat, mat_live_flat)
+    final_similarity = 0.7 * vector_similarity + 0.3 * matrix_similarity
+    difference = 1.0 - final_similarity
+    is_defect = difference >= threshold
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     inference_time_ms = (time.perf_counter() - start_time) * 1000
+
+    result = SimilarityResult(
+        vector_similarity=vector_similarity,
+        matrix_similarity=matrix_similarity,
+        final_similarity=final_similarity,
+        difference=difference,
+        is_defect=is_defect,
+    )
 
     st.subheader("Preview")
     preview_col1, preview_col2 = st.columns(2)
