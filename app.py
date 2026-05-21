@@ -95,31 +95,53 @@ def _compute_similarity(
     matrix_model: nn.Module,
     transform: transforms.Compose,
 ) -> SimilarityResult:
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
     # Batch inputs
     ref_tensor = transform(ref_image).unsqueeze(0).to(device)
     live_tensor = transform(live_image).unsqueeze(0).to(device)
     batch_tensor = torch.cat([ref_tensor, live_tensor], dim=0)
 
-    # Pass 1: Vector Model (batched)
-    with torch.no_grad():
-        feat_batch = vector_model(batch_tensor)
-        feat_ref = feat_batch[0:1].view(1, -1)
-        feat_live = feat_batch[1:2].view(1, -1)
-        vector_similarity = F.cosine_similarity(feat_ref, feat_live).item()
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
 
-    # Pass 2: Matrix Model (batched)
+    # Single Pass: Matrix Model (batched)
     with torch.no_grad():
         mat_batch = matrix_model(batch_tensor)
         
-        # Flatten the matrix outputs to vector form
+        # Flatten the matrix outputs to vector form for matrix similarity
         mat_ref_flat = mat_batch[0:1].view(1, -1)
         mat_live_flat = mat_batch[1:2].view(1, -1)
-        
         matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t2 = time.perf_counter()
+
+    # Calculate vector features manually from matrix features
+    with torch.no_grad():
+        feat_batch = F.adaptive_avg_pool2d(mat_batch, (1, 1)).view(2, -1)
+        feat_ref = feat_batch[0:1]
+        feat_live = feat_batch[1:2]
+        vector_similarity = F.cosine_similarity(feat_ref, feat_live).item()
+
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t3 = time.perf_counter()
 
     final_similarity = 0.7 * vector_similarity + 0.3 * matrix_similarity
     difference = 1.0 - final_similarity
     is_defect = difference >= threshold
+    
+    print(f"--- Inference Time Breakdown ---")
+    print(f"Preprocessing + Transfer: {(t1 - t0) * 1000:.2f} ms")
+    print(f"Single Batched Forward  : {(t2 - t1) * 1000:.2f} ms")
+    print(f"Manual Vector Compute   : {(t3 - t2) * 1000:.2f} ms")
+    print(f"Total Similarity Func   : {(t3 - t0) * 1000:.2f} ms")
+    print(f"--------------------------------")
 
     return SimilarityResult(
         vector_similarity=vector_similarity,
