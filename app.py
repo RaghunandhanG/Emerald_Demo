@@ -95,27 +95,26 @@ def _compute_similarity(
     matrix_model: nn.Module,
     transform: transforms.Compose,
 ) -> SimilarityResult:
+    # Batch inputs
     ref_tensor = transform(ref_image).unsqueeze(0).to(device)
     live_tensor = transform(live_image).unsqueeze(0).to(device)
+    batch_tensor = torch.cat([ref_tensor, live_tensor], dim=0)
 
+    # Pass 1: Vector Model (batched)
     with torch.no_grad():
-        _ = vector_model(ref_tensor)
-
-    with torch.no_grad():
-        feat_ref = vector_model(ref_tensor)
-        feat_live = vector_model(live_tensor)
-
-        feat_ref = feat_ref.view(feat_ref.size(0), -1)
-        feat_live = feat_live.view(feat_live.size(0), -1)
-
+        feat_batch = vector_model(batch_tensor)
+        feat_ref = feat_batch[0:1].view(1, -1)
+        feat_live = feat_batch[1:2].view(1, -1)
         vector_similarity = F.cosine_similarity(feat_ref, feat_live).item()
 
-        mat_ref = matrix_model(ref_tensor)
-        mat_live = matrix_model(live_tensor)
-
-        mat_ref_flat = mat_ref.view(mat_ref.size(0), -1)
-        mat_live_flat = mat_live.view(mat_live.size(0), -1)
-
+    # Pass 2: Matrix Model (batched)
+    with torch.no_grad():
+        mat_batch = matrix_model(batch_tensor)
+        
+        # Flatten the matrix outputs to vector form
+        mat_ref_flat = mat_batch[0:1].view(1, -1)
+        mat_live_flat = mat_batch[1:2].view(1, -1)
+        
         matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
 
     final_similarity = 0.7 * vector_similarity + 0.3 * matrix_similarity
