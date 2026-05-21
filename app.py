@@ -76,38 +76,46 @@ def _compute_similarity(
 
     # Pre-allocate and batch without individual image to(device) calls first
     # This avoids multiple PCIe bus transfers between CPU and GPU
-    ref_tensor = transform(ref_image)
-    live_tensor = transform(live_image)
+    ref_tensor = transform(ref_image).unsqueeze(0)
+    live_tensor = transform(live_image).unsqueeze(0)
     
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t1 = time.perf_counter()
     
-    # Send directly as a batch
-    batch_tensor = torch.stack([ref_tensor, live_tensor]).to(device)
+    # Send individually now
+    ref_tensor = ref_tensor.to(device)
+    live_tensor = live_tensor.to(device)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t2 = time.perf_counter()
 
-    # Single Pass: Matrix Model (batched)
+    # Two Passes: Matrix Model
     with torch.no_grad():
-        mat_batch = matrix_model(batch_tensor)
+        mat_ref = matrix_model(ref_tensor)
         
-        # Flatten the matrix outputs to vector form for matrix similarity
-        mat_ref_flat = mat_batch[0:1].view(1, -1)
-        mat_live_flat = mat_batch[1:2].view(1, -1)
-        matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    t_pass1 = time.perf_counter()
+        
+    with torch.no_grad():
+        mat_live = matrix_model(live_tensor)
 
     if device.type == 'cuda':
         torch.cuda.synchronize()
     t3 = time.perf_counter()
 
-    # Calculate vector features manually from matrix features
+    # Calculate vector features manually and compute both similarities
     with torch.no_grad():
-        feat_batch = F.adaptive_avg_pool2d(mat_batch, (1, 1)).view(2, -1)
-        feat_ref = feat_batch[0:1]
-        feat_live = feat_batch[1:2]
+        # Flatten the matrix outputs to vector form for matrix similarity
+        mat_ref_flat = mat_ref.view(1, -1)
+        mat_live_flat = mat_live.view(1, -1)
+        matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
+
+        # Vector pool calculations
+        feat_ref = F.adaptive_avg_pool2d(mat_ref, (1, 1)).view(1, -1)
+        feat_live = F.adaptive_avg_pool2d(mat_live, (1, 1)).view(1, -1)
         vector_similarity = F.cosine_similarity(feat_ref, feat_live).item()
 
     if device.type == 'cuda':
@@ -121,8 +129,9 @@ def _compute_similarity(
     print(f"--- Inference Time Breakdown ---")
     print(f"Transforms (CPU)        : {(t1 - t0) * 1000:.2f} ms")
     print(f"PCIe Transfer to GPU    : {(t2 - t1) * 1000:.2f} ms")
-    print(f"Single Batched Forward  : {(t3 - t2) * 1000:.2f} ms")
-    print(f"Manual Vector Compute   : {(t4 - t3) * 1000:.2f} ms")
+    print(f"Pass 1 Forward          : {(t_pass1 - t2) * 1000:.2f} ms")
+    print(f"Pass 2 Forward          : {(t3 - t_pass1) * 1000:.2f} ms")
+    print(f"Metrics & Pooling       : {(t4 - t3) * 1000:.2f} ms")
     print(f"Total Similarity Func   : {(t4 - t0) * 1000:.2f} ms")
     print(f"--------------------------------")
 
