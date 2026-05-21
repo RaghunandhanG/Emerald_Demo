@@ -34,64 +34,34 @@ def _load_image(file) -> Image.Image:
 
 
 @st.cache_resource
-def _load_models(device: torch.device) -> tuple[nn.Module, nn.Module]:
+def _load_models(device: torch.device) -> nn.Module:
     weights_dir = Path.cwd() / "models"
     weights_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = weights_dir / "wide_resnet50_2.pth"
-    weights = models.Wide_ResNet50_2_Weights.DEFAULT
-
-    base_model = models.wide_resnet50_2(weights=None)
-    try:
-        if weights_path.exists():
-            state_dict = torch.load(weights_path, map_location="cpu")
-            base_model.load_state_dict(state_dict)
-        else:
-            raise FileNotFoundError("Local weights not found")
-    except Exception:
-        state_dict = torch.hub.load_state_dict_from_url(
-            weights.url,
-            model_dir=str(weights_dir),
-            check_hash=True,
-            map_location="cpu",
-        )
-        torch.save(state_dict, weights_path)
-        base_model.load_state_dict(state_dict)
-
-    base_model = base_model.to(device)
-
-    vector_model = nn.Sequential(
-        *list(base_model.children())[:-1]
-    ).to(device)
-
-    matrix_model = nn.Sequential(
-        *list(base_model.children())[:-2]
-    ).to(device)
-
-    vector_model.eval()
+    
+    from ultralytics import YOLO
+    # yolo downloads to root, but it's fine, we can just load it
+    yolo = YOLO("yolov8n-cls.pt")
+    
+    # We only need the feature extractor part, which is up to layer 8
+    # Layer 9 is the Classify head which pools and outputs 1000 classes
+    matrix_model = nn.Sequential(*list(yolo.model.model.children())[:9]).to(device)
     matrix_model.eval()
 
-    return vector_model, matrix_model
-
+    return matrix_model
 
 def _get_transform() -> transforms.Compose:
     return transforms.Compose(
         [
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
         ]
     )
-
 
 def _compute_similarity(
     ref_image: Image.Image,
     live_image: Image.Image,
     threshold: float,
     device: torch.device,
-    vector_model: nn.Module,
     matrix_model: nn.Module,
     transform: transforms.Compose,
 ) -> SimilarityResult:
@@ -164,7 +134,7 @@ def main() -> None:
         st.success(f"GPU configured: {torch.cuda.get_device_name(0)}")
     else:
         st.warning("GPU not available, using CPU")
-    vector_model, matrix_model = _load_models(device)
+    matrix_model = _load_models(device)
     transform = _get_transform()
 
     col_left, col_right = st.columns(2)
@@ -199,7 +169,6 @@ def main() -> None:
         live_image,
         threshold,
         device,
-        vector_model,
         matrix_model,
         transform,
     )
