@@ -34,7 +34,7 @@ def _load_image(file) -> Image.Image:
 
 
 @st.cache_resource
-def _load_models(device: torch.device) -> tuple[nn.Module, nn.Module]:
+def _load_models(device: torch.device) -> nn.Module:
     weights_dir = Path.cwd() / "models"
     weights_dir.mkdir(parents=True, exist_ok=True)
     weights_path = weights_dir / "wide_resnet50_2.pth"
@@ -59,18 +59,13 @@ def _load_models(device: torch.device) -> tuple[nn.Module, nn.Module]:
 
     base_model = base_model.to(device)
 
-    vector_model = nn.Sequential(
-        *list(base_model.children())[:-1]
-    ).to(device)
-
-    matrix_model = nn.Sequential(
+    feature_model = nn.Sequential(
         *list(base_model.children())[:-2]
     ).to(device)
 
-    vector_model.eval()
-    matrix_model.eval()
+    feature_model.eval()
 
-    return vector_model, matrix_model
+    return feature_model
 
 
 def _get_transform() -> transforms.Compose:
@@ -91,30 +86,23 @@ def _compute_similarity(
     live_image: Image.Image,
     threshold: float,
     device: torch.device,
-    vector_model: nn.Module,
-    matrix_model: nn.Module,
+    feature_model: nn.Module,
     transform: transforms.Compose,
 ) -> SimilarityResult:
     ref_tensor = transform(ref_image).unsqueeze(0).to(device)
     live_tensor = transform(live_image).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        _ = vector_model(ref_tensor)
+        feat_ref = feature_model(ref_tensor)
+        feat_live = feature_model(live_tensor)
 
-    with torch.no_grad():
-        feat_ref = vector_model(ref_tensor)
-        feat_live = vector_model(live_tensor)
+        pooled_ref = F.adaptive_avg_pool2d(feat_ref, (1, 1)).view(feat_ref.size(0), -1)
+        pooled_live = F.adaptive_avg_pool2d(feat_live, (1, 1)).view(feat_live.size(0), -1)
 
-        feat_ref = feat_ref.view(feat_ref.size(0), -1)
-        feat_live = feat_live.view(feat_live.size(0), -1)
+        vector_similarity = F.cosine_similarity(pooled_ref, pooled_live).item()
 
-        vector_similarity = F.cosine_similarity(feat_ref, feat_live).item()
-
-        mat_ref = matrix_model(ref_tensor)
-        mat_live = matrix_model(live_tensor)
-
-        mat_ref_flat = mat_ref.view(mat_ref.size(0), -1)
-        mat_live_flat = mat_live.view(mat_live.size(0), -1)
+        mat_ref_flat = feat_ref.view(feat_ref.size(0), -1)
+        mat_live_flat = feat_live.view(feat_live.size(0), -1)
 
         matrix_similarity = F.cosine_similarity(mat_ref_flat, mat_live_flat).item()
 
@@ -143,7 +131,7 @@ def main() -> None:
         st.success(f"GPU configured: {torch.cuda.get_device_name(0)}")
     else:
         st.warning("GPU not available, using CPU")
-    vector_model, matrix_model = _load_models(device)
+    feature_model = _load_models(device)
     transform = _get_transform()
 
     col_left, col_right = st.columns(2)
@@ -178,8 +166,7 @@ def main() -> None:
         live_image,
         threshold,
         device,
-        vector_model,
-        matrix_model,
+        feature_model,
         transform,
     )
     inference_time_ms = (time.perf_counter() - start_time) * 1000
