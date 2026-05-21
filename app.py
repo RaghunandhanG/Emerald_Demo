@@ -68,10 +68,13 @@ def _load_models(device: torch.device) -> tuple[nn.Module, nn.Module]:
 
     # Warm-up pass to initialize GPU memory and cuDNN benchmarks during startup
     if device.type == 'cuda':
+        t_start = time.perf_counter()
         with torch.no_grad():
             dummy_input = torch.randn(1, 3, 224, 224).to(device)
             _ = matrix_model(dummy_input)
             torch.cuda.synchronize()
+        t_end = time.perf_counter()
+        print(f"--- Model Warm-up Complete: {(t_end - t_start) * 1000:.2f} ms ---")
 
     return matrix_model
 
